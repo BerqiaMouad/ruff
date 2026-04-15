@@ -28,8 +28,8 @@ use crate::types::relation::{
     HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker,
 };
 use crate::types::typed_dict::{
-    UnpackedTypedDictKey, extract_unpacked_typed_dict_keys,
-    extract_unpacked_typed_dict_keys_from_kwargs_annotation,
+    UnpackedTypedDictKey, extract_unpacked_typed_dict_keys_from_kwargs_annotation,
+    extract_unpacked_typed_dict_keys_from_value_type,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType,
@@ -3268,7 +3268,7 @@ impl<'db> Parameter<'db> {
         db: &'db dyn Db,
     ) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
         (self.is_keyword_variadic() && self.has_unpacked_kwargs_annotation)
-            .then(|| extract_unpacked_typed_dict_keys(db, self.annotated_type))
+            .then(|| extract_unpacked_typed_dict_keys_from_value_type(db, self.annotated_type))
             .flatten()
     }
 

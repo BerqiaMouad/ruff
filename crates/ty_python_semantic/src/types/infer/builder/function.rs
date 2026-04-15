@@ -574,8 +574,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let overlapping = parameters
             .iter_non_variadic_params()
             .skip(parameters.posonlyargs.len())
-            // Legacy PEP 484 positional-only parameters are not callable by keyword, so they do
-            // not overlap with keys accepted through `**kwargs`.
+            // Legacy PEP 484 positional-only parameters like `def f(__x: int, **kwargs:
+            // Unpack[TD])` are not callable by keyword, so they do not overlap with keys
+            // accepted through `**kwargs`.
             .filter(|parameter| !parameter.uses_pep_484_positional_only_convention())
             .map(|parameter| &parameter.parameter)
             .filter(|parameter| unpacked_keys.contains_key(&parameter.name.id))

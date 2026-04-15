@@ -15,7 +15,7 @@ use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
 use crate::types::string_annotation::parse_string_annotation;
 use crate::types::tuple::{TupleSpecBuilder, TupleType};
-use crate::types::typed_dict::extract_unpacked_typed_dict_keys;
+use crate::types::typed_dict::resolve_unpacked_typed_dict_kwargs_annotation_target;
 use ty_python_core::scope::ScopeKind;
 
 use crate::types::{
@@ -2149,7 +2149,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     .inference_flags
                     .contains(InferenceFlags::IN_KWARG_ANNOTATION)
                 {
-                    if extract_unpacked_typed_dict_keys(self.db(), inner_ty).is_some() {
+                    if resolve_unpacked_typed_dict_kwargs_annotation_target(self.db(), inner_ty)
+                        .is_some()
+                    {
                         return inner_ty;
                     }
 

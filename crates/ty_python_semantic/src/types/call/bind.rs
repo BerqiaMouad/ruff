@@ -49,7 +49,7 @@ use crate::types::signatures::{
     CallableSignature, Parameter, ParameterForm, ParameterKind, Parameters,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
-use crate::types::typed_dict::extract_unpacked_typed_dict_keys;
+use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_value_type;
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::{
     BoundMethodType, BoundTypeVarInstance, CallableType, ClassLiteral, DATACLASS_FLAGS,
@@ -4103,9 +4103,9 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_index: usize,
         argument_type: Option<Type<'db>>,
     ) {
-        if let Some(unpacked_keys) = argument_type
-            .and_then(|argument_type| extract_unpacked_typed_dict_keys(db, argument_type))
-        {
+        if let Some(unpacked_keys) = argument_type.and_then(|argument_type| {
+            extract_unpacked_typed_dict_keys_from_value_type(db, argument_type)
+        }) {
             for (name, unpacked_key) in unpacked_keys {
                 let _ = self.match_keyword(
                     db,
@@ -4939,7 +4939,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
             .iter()
             .any(Option::is_some)
         {
-            if extract_unpacked_typed_dict_keys(self.db, argument_type).is_none()
+            if extract_unpacked_typed_dict_keys_from_value_type(self.db, argument_type).is_none()
                 && argument_type.as_paramspec_typevar(self.db).is_none()
             {
                 let Some((key_type, _)) = argument_type.unpack_keys_and_items(self.db) else {
@@ -4979,6 +4979,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
             return;
         }
+
         let value_type_paramspec =
             if let Some(paramspec) = argument_type.as_paramspec_typevar(self.db) {
                 Some(paramspec)

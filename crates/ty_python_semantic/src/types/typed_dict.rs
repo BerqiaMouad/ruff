@@ -849,8 +849,8 @@ impl UnpackedTypedDictKey<'_> {
     }
 }
 
-/// Extracts `TypedDict` keys, their value types, and whether they are required when unpacked as
-/// `**kwargs`, resolving type aliases and handling intersections and unions.
+/// Extracts `TypedDict` keys, their value types, and whether they are required when an unpacked
+/// `**kwargs` value has this type, resolving type aliases and handling intersections and unions.
 ///
 /// For intersections, returns ALL declared keys from ALL `TypedDict` types (union of keys),
 /// because unpacking a value of an intersection type may expose any key declared by any
@@ -858,7 +858,7 @@ impl UnpackedTypedDictKey<'_> {
 /// intersected, and the key is considered required if any constituent `TypedDict` requires it.
 /// For unions, returns all keys that may appear in any arm, unioning value types for shared keys,
 /// and a key is only considered required if every arm requires it.
-pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
+pub(crate) fn extract_unpacked_typed_dict_keys_from_value_type<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
 ) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
@@ -886,7 +886,9 @@ pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
             let all_key_maps: Vec<_> = intersection
                 .positive(db)
                 .iter()
-                .filter_map(|element| extract_unpacked_typed_dict_keys(db, *element))
+                .filter_map(|element| {
+                    extract_unpacked_typed_dict_keys_from_value_type(db, *element)
+                })
                 .collect();
 
             if all_key_maps.is_empty() {
@@ -920,7 +922,7 @@ pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
             let key_maps: Vec<_> = union
                 .elements(db)
                 .iter()
-                .map(|element| extract_unpacked_typed_dict_keys(db, *element))
+                .map(|element| extract_unpacked_typed_dict_keys_from_value_type(db, *element))
                 .collect::<Option<_>>()?;
 
             let all_keys: OrderSet<Name> = key_maps
@@ -957,7 +959,9 @@ pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
 
             Some(result)
         }
-        Type::TypeAlias(alias) => extract_unpacked_typed_dict_keys(db, alias.value_type(db)),
+        Type::TypeAlias(alias) => {
+            extract_unpacked_typed_dict_keys_from_value_type(db, alias.value_type(db))
+        }
         // All other types cannot contain a TypedDict
         Type::Dynamic(_)
         | Type::Divergent(_)
@@ -991,6 +995,9 @@ pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
 
 /// Extracts unpacked `TypedDict` keys for a `**kwargs` annotation only when the annotation
 /// explicitly uses `Unpack[...]`.
+///
+/// Per [PEP 692](https://peps.python.org/pep-0692/#typeddict-unions), this accepts only a concrete
+/// `TypedDict` target, or a type alias resolving to  one.
 pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation<'db>(
     db: &'db dyn Db,
     annotation: &ast::Expr,
@@ -1002,8 +1009,76 @@ pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation<'db>(
     };
 
     (expression_type(value) == Type::SpecialForm(SpecialFormType::Unpack))
-        .then(|| extract_unpacked_typed_dict_keys(db, annotated_type))
+        .then(|| extract_unpacked_typed_dict_keys_from_kwargs_annotation_target(db, annotated_type))
         .flatten()
+}
+
+/// Resolve the `TypedDictType` target from a given `Unpack[...]` annotation.
+///
+/// Per [PEP 692](https://peps.python.org/pep-0692/#typeddict-unions), unions (for example) are not
+/// allowed in such annotations.
+pub(crate) fn resolve_unpacked_typed_dict_kwargs_annotation_target<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+) -> Option<TypedDictType<'db>> {
+    match ty {
+        Type::TypedDict(typed_dict) => Some(typed_dict),
+        Type::TypeAlias(alias) => {
+            resolve_unpacked_typed_dict_kwargs_annotation_target(db, alias.value_type(db))
+        }
+        Type::Dynamic(_)
+        | Type::Divergent(_)
+        | Type::Never
+        | Type::FunctionLiteral(_)
+        | Type::BoundMethod(_)
+        | Type::KnownBoundMethod(_)
+        | Type::WrapperDescriptor(_)
+        | Type::DataclassDecorator(_)
+        | Type::DataclassTransformer(_)
+        | Type::Callable(_)
+        | Type::ModuleLiteral(_)
+        | Type::ClassLiteral(_)
+        | Type::GenericAlias(_)
+        | Type::SubclassOf(_)
+        | Type::NominalInstance(_)
+        | Type::ProtocolInstance(_)
+        | Type::SpecialForm(_)
+        | Type::KnownInstance(_)
+        | Type::PropertyInstance(_)
+        | Type::AlwaysTruthy
+        | Type::AlwaysFalsy
+        | Type::LiteralValue(_)
+        | Type::TypeVar(_)
+        | Type::BoundSuper(_)
+        | Type::TypeIs(_)
+        | Type::TypeGuard(_)
+        | Type::NewTypeInstance(_)
+        | Type::Union(_)
+        | Type::Intersection(_) => None,
+    }
+}
+
+pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation_target<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
+    Some(
+        resolve_unpacked_typed_dict_kwargs_annotation_target(db, ty)?
+            .items(db)
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.clone(),
+                    UnpackedTypedDictKey {
+                        value_ty: field.declared_ty,
+                        presence: UnpackedTypedDictKeyPresence::from_guaranteed(
+                            field.is_required(),
+                        ),
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Infers each unpacked `**kwargs` constructor argument exactly once.
@@ -1055,7 +1130,9 @@ pub(super) fn collect_guaranteed_keyword_keys<'db>(
         // TODO: also extract guaranteed keys from unpacked dict literals like `**{"a": 1}`.
         // Today we only suppress positional-key diagnostics for explicit keywords and unpacked
         // TypedDicts, which makes those literal-unpack cases inconsistent with equivalent calls.
-        } else if let Some(unpacked_keys) = extract_unpacked_typed_dict_keys(db, unpacked_type) {
+        } else if let Some(unpacked_keys) =
+            extract_unpacked_typed_dict_keys_from_value_type(db, unpacked_type)
+        {
             provided_keys.extend(unpacked_keys.into_iter().filter_map(|(key, unpacked_key)| {
                 unpacked_key.is_guaranteed_present().then_some(key)
             }));
@@ -1201,7 +1278,7 @@ fn validate_from_typed_dict_argument<'db, 'ast>(
 ) -> Option<OrderSet<Name>> {
     let db = context.db();
     let typed_dict_items = typed_dict.items(db);
-    let unpacked_keys = extract_unpacked_typed_dict_keys(db, arg_ty)?
+    let unpacked_keys = extract_unpacked_typed_dict_keys_from_value_type(db, arg_ty)?
         .into_iter()
         .filter(|(key_name, _)| typed_dict_items.contains_key(key_name))
         .collect();
@@ -1534,7 +1611,8 @@ fn validate_from_keywords<'db, 'ast>(
                         guaranteed_keys.entry(key_name.clone()).or_insert(None);
                     }
                 }
-            } else if let Some(unpacked_keys) = extract_unpacked_typed_dict_keys(db, unpacked_type)
+            } else if let Some(unpacked_keys) =
+                extract_unpacked_typed_dict_keys_from_value_type(db, unpacked_type)
             {
                 for key_name in validate_extracted_typed_dict_keys(
                     context,

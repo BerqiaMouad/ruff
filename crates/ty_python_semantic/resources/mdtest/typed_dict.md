@@ -2957,7 +2957,7 @@ Using `Unpack[TypedDict]` on a `**kwargs` parameter should expose the `TypedDict
 the function body and in the callable signature:
 
 ```py
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, Union
 from typing_extensions import NotRequired, Required, TypedDict, Unpack
 
 class TD1(TypedDict):
@@ -3020,6 +3020,16 @@ T = TypeVar("T", bound=TD2)
 
 def func6(**kwargs: Unpack[T]) -> None:  # error: [invalid-type-form]
     pass
+
+TDUnion = Union[TD1, TD2]
+
+def func_union(**kwargs: Unpack[TDUnion]) -> None:  # error: [invalid-type-form]
+    pass
+
+TD2Alias = TD2
+
+def func_alias(**kwargs: Unpack[TD2Alias]) -> None:
+    reveal_type(kwargs)  # revealed: TD2
 
 class MaybeX(TypedDict, total=False):
     x: str
