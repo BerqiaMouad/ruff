@@ -2953,11 +2953,15 @@ bad_td2: TD2 = {"optional": 42}
 
 ## `Unpack[TypedDict]` in `**kwargs`
 
-Using `Unpack[TypedDict]` on a `**kwargs` parameter should expose the `TypedDict` shape both inside
-the function body and in the callable signature:
+Using `Unpack[TypedDict]` on a `**kwargs` parameter should expose named keyword parameters to
+callers while preserving the original `TypedDict` shape inside the function body.
+
+### Inside the function body
+
+Inside the function, `kwargs` should still behave like the original `TypedDict`, including
+flow-sensitive access to optional keys.
 
 ```py
-from typing import Protocol, TypeVar, Union
 from typing_extensions import NotRequired, Required, TypedDict, Unpack
 
 class TD1(TypedDict):
@@ -2967,30 +2971,70 @@ class TD1(TypedDict):
 class TD2(TD1):
     v3: Required[str]
 
-def func1(**kwargs: Unpack[TD2]) -> None:
+def func(**kwargs: Unpack[TD2]) -> None:
     reveal_type(kwargs)  # revealed: TD2
     reveal_type(kwargs["v1"])  # revealed: int
     if "v2" in kwargs:
         reveal_type(kwargs["v2"])  # revealed: str
     reveal_type(kwargs["v3"])  # revealed: str
+```
+
+### Calling the function
+
+At the call site, required keys must be provided, unknown keys must be rejected, and `**kwargs`
+unpacking should be validated against the `TypedDict` shape.
+
+```py
+from typing_extensions import NotRequired, Required, TypedDict, Unpack
+
+class TD1(TypedDict):
+    v1: Required[int]
+    v2: NotRequired[str]
+
+class TD2(TD1):
+    v3: Required[str]
+
+def func(**kwargs: Unpack[TD2]) -> None:
+    pass
 
 # error: [missing-argument]
-func1()
-func1(v1=1, v3="ok")
+func()
+func(v1=1, v3="ok")
 
 # error: [unknown-argument]
-func1(v1=1, v3="ok", v4=1)
+func(v1=1, v3="ok", v4=1)
 
 td2 = TD2(v1=1, v3="ok")
-func1(**td2)
+func(**td2)
 
 untyped_dict: dict[str, str] = {}
 # error: [missing-argument]
 # error: [invalid-argument-type]
-func1(**untyped_dict)
+func(**untyped_dict)
 
 # error: [parameter-already-assigned]
-func1(v1=1, **td2)
+func(v1=1, **td2)
+```
+
+### Callable signatures
+
+A callable using `**kwargs: Unpack[TD2]` should line up with equivalent explicit keyword-only
+signatures, but not with signatures that are missing required keys or that do not accept the
+unpacked form.
+
+```py
+from typing import Protocol
+from typing_extensions import NotRequired, Required, TypedDict, Unpack
+
+class TD1(TypedDict):
+    v1: Required[int]
+    v2: NotRequired[str]
+
+class TD2(TD1):
+    v3: Required[str]
+
+def func(**kwargs: Unpack[TD2]) -> None:
+    pass
 
 class ExplicitKwargs(Protocol):
     def __call__(self, *, v1: int, v3: str, v2: str = "") -> None: ...
@@ -3001,17 +3045,34 @@ class TypedDictKwargs(Protocol):
 class MissingRequiredKwarg(Protocol):
     def __call__(self, *, v1: int) -> None: ...
 
-explicit_ok: ExplicitKwargs = func1
-typed_dict_ok: TypedDictKwargs = func1
+explicit_ok: ExplicitKwargs = func
+typed_dict_ok: TypedDictKwargs = func
 
 # error: [invalid-assignment]
-missing_required: MissingRequiredKwarg = func1
+missing_required: MissingRequiredKwarg = func
 
 def func7(*, v1: int, v3: str, v2: str = "") -> None:
     pass
 
 # error: [invalid-assignment]
 typed_dict_bad: TypedDictKwargs = func7
+```
+
+### Invalid `Unpack` forms
+
+These forms should be rejected: mixing explicit parameters with conflicting unpacked names, using a
+type variable, or using a union instead of a concrete `TypedDict`.
+
+```py
+from typing import TypeVar, Union
+from typing_extensions import NotRequired, Required, TypedDict, Unpack
+
+class TD1(TypedDict):
+    v1: Required[int]
+    v2: NotRequired[str]
+
+class TD2(TD1):
+    v3: Required[str]
 
 def func5(v1: int, **kwargs: Unpack[TD2]) -> None:  # error: [invalid-type-form]
     pass
@@ -3025,11 +3086,36 @@ TDUnion = Union[TD1, TD2]
 
 def func_union(**kwargs: Unpack[TDUnion]) -> None:  # error: [invalid-type-form]
     pass
+```
+
+### Aliases are followed
+
+Type aliases to a `TypedDict` should still be accepted in `Unpack`.
+
+```py
+from typing_extensions import NotRequired, Required, TypedDict, Unpack
+
+class TD1(TypedDict):
+    v1: Required[int]
+    v2: NotRequired[str]
+
+class TD2(TD1):
+    v3: Required[str]
 
 TD2Alias = TD2
 
 def func_alias(**kwargs: Unpack[TD2Alias]) -> None:
     reveal_type(kwargs)  # revealed: TD2
+```
+
+### Regression coverage
+
+These cases check a few tricky edges: unpacking non-string-keyed mappings, combining explicit
+keyword arguments with unpacked `TypedDict`s, missing required keys from partial `TypedDict`s, and
+legacy dunder-style keyword names.
+
+```py
+from typing_extensions import TypedDict, Unpack
 
 class MaybeX(TypedDict, total=False):
     x: str
