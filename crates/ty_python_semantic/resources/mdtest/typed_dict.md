@@ -3055,6 +3055,41 @@ def _regressions(
     legacy(1, **legacy_kwargs)
 ```
 
+## Bare `TypedDict` annotations in `**kwargs`
+
+A bare `TypedDict` annotation on `**kwargs` still means “arbitrary keyword names whose values have
+this `TypedDict` type”. Only `Unpack[TypedDict]` should expose named keyword parameters.
+
+```py
+from typing import Protocol
+from typing_extensions import TypedDict
+
+class BareKwargs(TypedDict):
+    a: int
+
+def plain(**kwargs: BareKwargs) -> None:
+    reveal_type(kwargs)  # revealed: dict[str, BareKwargs]
+
+plain(a=BareKwargs(a=1))
+
+# error: [invalid-argument-type]
+plain(a=1)
+
+class BareKwargsProtocol(Protocol):
+    def __call__(self, **kwargs: BareKwargs) -> None: ...
+
+class ExplicitAProtocol(Protocol):
+    def __call__(self, *, a: int) -> None: ...
+
+bare_kwargs_ok: BareKwargsProtocol = plain
+
+# error: [invalid-assignment]
+explicit_a_bad: ExplicitAProtocol = plain
+
+def overlapping(x: int, **kwargs: BareKwargs) -> None:
+    reveal_type(kwargs)  # revealed: dict[str, BareKwargs]
+```
+
 ## `dict[str, Any]` remains permissive
 
 When the unpacked mapping is `dict[str, Any]`, other type checkers treat it as permissive and do not

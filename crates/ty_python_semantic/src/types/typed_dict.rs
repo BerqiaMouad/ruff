@@ -18,8 +18,8 @@ use super::diagnostic::{
 };
 use super::infer::infer_deferred_types;
 use super::{
-    ApplyTypeMappingVisitor, IntersectionType, Type, TypeMapping, TypeQualifiers, UnionBuilder,
-    definition_expression_type, visitor,
+    ApplyTypeMappingVisitor, IntersectionType, SpecialFormType, Type, TypeMapping, TypeQualifiers,
+    UnionBuilder, definition_expression_type, visitor,
 };
 use crate::Db;
 use crate::types::TypeContext;
@@ -987,6 +987,23 @@ pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
         | Type::TypeGuard(_)
         | Type::NewTypeInstance(_) => None,
     }
+}
+
+/// Extracts unpacked `TypedDict` keys for a `**kwargs` annotation only when the annotation
+/// explicitly uses `Unpack[...]`.
+pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation<'db>(
+    db: &'db dyn Db,
+    annotation: &ast::Expr,
+    annotated_type: Type<'db>,
+    expression_type: impl FnOnce(&ast::Expr) -> Type<'db>,
+) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
+    let ast::Expr::Subscript(ast::ExprSubscript { value, .. }) = annotation else {
+        return None;
+    };
+
+    (expression_type(value) == Type::SpecialForm(SpecialFormType::Unpack))
+        .then(|| extract_unpacked_typed_dict_keys(db, annotated_type))
+        .flatten()
 }
 
 /// Infers each unpacked `**kwargs` constructor argument exactly once.

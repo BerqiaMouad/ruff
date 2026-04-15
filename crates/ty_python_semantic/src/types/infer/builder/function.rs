@@ -26,7 +26,7 @@ use crate::{
             function_known_decorators, nearest_enclosing_function,
         },
         infer_definition_types, infer_scope_types, todo_type,
-        typed_dict::extract_unpacked_typed_dict_keys,
+        typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
     },
 };
 use ty_python_core::{
@@ -562,8 +562,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return;
         };
         let annotated_type = self.file_expression_type(annotation);
-        let Some(unpacked_keys) = extract_unpacked_typed_dict_keys(self.db(), annotated_type)
-        else {
+        let Some(unpacked_keys) = extract_unpacked_typed_dict_keys_from_kwargs_annotation(
+            self.db(),
+            annotation,
+            annotated_type,
+            |expr| self.file_expression_type(expr),
+        ) else {
             return;
         };
 
@@ -937,7 +941,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         )
                     }
                 }
-            } else if extract_unpacked_typed_dict_keys(db, annotated_type).is_some() {
+            } else if extract_unpacked_typed_dict_keys_from_kwargs_annotation(
+                db,
+                annotation,
+                annotated_type,
+                |expr| self.file_expression_type(expr),
+            )
+            .is_some()
+            {
                 annotated_type
             } else {
                 KnownClass::Dict
