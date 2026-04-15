@@ -49,6 +49,7 @@ use crate::types::signatures::{
     CallableSignature, Parameter, ParameterForm, ParameterKind, Parameters,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
+use crate::types::typed_dict::extract_unpacked_typed_dict_keys;
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::{
     BoundMethodType, BoundTypeVarInstance, CallableType, ClassLiteral, DATACLASS_FLAGS,
@@ -3618,10 +3619,56 @@ impl ArgumentForms {
     }
 }
 
+/// Per-parameter binding state accumulated while matching call arguments.
 #[derive(Default, Clone, Copy)]
 struct ParameterInfo {
-    matched: bool,
+    /// Whether the parameter is unmatched, provisionally matched, or definitively matched.
+    match_state: ParameterMatchState,
+    /// Suppresses a later missing-argument error after a more specific binding error has already
+    /// been reported for this parameter.
     suppress_missing_error: bool,
+}
+
+/// The accumulated match state for a parameter after considering some subset of call arguments.
+#[derive(Default, Clone, Copy)]
+enum ParameterMatchState {
+    /// No argument has matched this parameter yet.
+    #[default]
+    Unmatched,
+    /// The parameter is matched only through a conditionally-present source, such as a
+    /// `NotRequired` key from `**kwargs: Unpack[TypedDict]`.
+    ///
+    /// Provisional matches still participate in duplicate and type checking, but they do not
+    /// satisfy required-argument handling.
+    Provisional,
+    /// The parameter is definitely satisfied by an argument at this call site.
+    Definitive,
+}
+
+impl ParameterMatchState {
+    const fn is_matched(self) -> bool {
+        !matches!(self, Self::Unmatched)
+    }
+
+    const fn is_definitive(self) -> bool {
+        matches!(self, Self::Definitive)
+    }
+
+    const fn with_match_kind(self, match_kind: ParameterMatchKind) -> Self {
+        match (self, match_kind) {
+            (Self::Definitive, _) | (_, ParameterMatchKind::Definitive) => Self::Definitive,
+            (Self::Provisional, _) | (_, ParameterMatchKind::Provisional) => Self::Provisional,
+        }
+    }
+}
+
+/// Whether a successful parameter match is definitely or only conditionally present.
+#[derive(Clone, Copy)]
+enum ParameterMatchKind {
+    /// The argument definitely binds this parameter.
+    Definitive,
+    /// The argument may bind this parameter at runtime, but does not guarantee its presence.
+    Provisional,
 }
 
 struct ArgumentMatcher<'a, 'db> {
@@ -3711,6 +3758,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         parameter: &Parameter<'db>,
         positional: bool,
         variable_argument_length: bool,
+        match_kind: ParameterMatchKind,
     ) {
         if !matches!(argument, Argument::Synthetic) {
             let adjusted_argument_index = argument_index - self.num_synthetic_args;
@@ -3723,7 +3771,10 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                 }
             }
         }
-        if self.parameter_info[parameter_index].matched {
+        if self.parameter_info[parameter_index]
+            .match_state
+            .is_matched()
+        {
             if !parameter.is_variadic() && !parameter.is_keyword_variadic() {
                 self.errors.push(BindingError::ParameterAlreadyAssigned {
                     argument_index: self.get_argument_index(argument_index),
@@ -3744,7 +3795,9 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         matched_argument.parameters.push(parameter_index);
         matched_argument.types.push(argument_type);
         matched_argument.matched = true;
-        self.parameter_info[parameter_index].matched = true;
+        self.parameter_info[parameter_index].match_state = self.parameter_info[parameter_index]
+            .match_state
+            .with_match_kind(match_kind);
     }
 
     fn match_positional(
@@ -3776,21 +3829,21 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             !parameter.is_variadic(),
             variable_argument_length,
+            ParameterMatchKind::Definitive,
         );
         Ok(())
     }
 
     fn match_keyword(
         &mut self,
+        db: &'db dyn Db,
         argument_index: usize,
         argument: Argument<'a>,
         argument_type: Option<Type<'db>>,
         name: &str,
+        match_kind: ParameterMatchKind,
     ) -> Result<(), ()> {
-        let Some((parameter_index, parameter)) = self
-            .parameters
-            .keyword_by_name(name)
-            .or_else(|| self.parameters.keyword_variadic())
+        let Some((parameter_index, parameter)) = self.parameters.bindable_keyword_by_name(db, name)
         else {
             if let Some((parameter_index, parameter)) =
                 self.parameters.positional_only_by_name(name)
@@ -3817,6 +3870,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             parameter,
             false,
             false,
+            match_kind,
         );
         Ok(())
     }
@@ -4048,53 +4102,77 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_index: usize,
         argument_type: Option<Type<'db>>,
     ) {
-        if let Some(Type::TypedDict(typed_dict)) = argument_type {
-            // Special case TypedDict because we know which keys are present.
-            for (name, field) in typed_dict.items(db) {
+        if let Some(unpacked_keys) = argument_type
+            .and_then(|argument_type| extract_unpacked_typed_dict_keys(db, argument_type))
+        {
+            for (name, unpacked_key) in unpacked_keys {
                 let _ = self.match_keyword(
+                    db,
                     argument_index,
                     Argument::Keywords,
-                    Some(field.declared_ty),
+                    Some(unpacked_key.value_ty),
                     name.as_str(),
+                    if unpacked_key.is_guaranteed_present() {
+                        ParameterMatchKind::Definitive
+                    } else {
+                        ParameterMatchKind::Provisional
+                    },
                 );
             }
-        } else {
-            for (parameter_index, parameter) in self.parameters.iter().enumerate() {
-                if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic()
-                {
-                    continue;
-                }
+            return;
+        }
 
-                if matches!(
-                    parameter.kind(),
-                    ParameterKind::PositionalOnly { .. } | ParameterKind::Variadic { .. }
-                ) {
-                    continue;
-                }
+        if let Some((parameter_index, parameter, _)) =
+            self.parameters.unpacked_typed_dict_keyword_variadic(db)
+        {
+            self.errors.push(BindingError::InvalidArgumentType {
+                parameter: ParameterContext::new(parameter, parameter_index, false),
+                argument_index: self.get_argument_index(argument_index),
+                expected_ty: parameter.annotated_type(),
+                provided_ty: argument_type.unwrap_or_else(Type::unknown),
+            });
+            return;
+        }
 
-                let parameter_name = self.parameters[parameter_index]
-                    .keyword_name()
-                    .map(Name::as_str);
-
-                let value_type = match argument_type {
-                    Some(argument_type) => argument_type
-                        .as_paramspec_typevar(db)
-                        .or_else(|| argument_type.getitem_dunder_call(db, parameter_name))
-                        .unwrap_or(Type::unknown()),
-
-                    None => Type::unknown(),
-                };
-
-                self.assign_argument(
-                    argument_index,
-                    Argument::Keywords,
-                    Some(value_type),
-                    parameter_index,
-                    parameter,
-                    false,
-                    true,
-                );
+        for (parameter_index, parameter) in self.parameters.iter().enumerate() {
+            if self.parameter_info[parameter_index]
+                .match_state
+                .is_definitive()
+                && !parameter.is_keyword_variadic()
+            {
+                continue;
             }
+
+            if matches!(
+                parameter.kind(),
+                ParameterKind::PositionalOnly { .. } | ParameterKind::Variadic { .. }
+            ) {
+                continue;
+            }
+
+            let parameter_name = self.parameters[parameter_index]
+                .keyword_name()
+                .map(Name::as_str);
+
+            let value_type = match argument_type {
+                Some(argument_type) => argument_type
+                    .as_paramspec_typevar(db)
+                    .or_else(|| argument_type.getitem_dunder_call(db, parameter_name))
+                    .unwrap_or(Type::unknown()),
+
+                None => Type::unknown(),
+            };
+
+            self.assign_argument(
+                argument_index,
+                Argument::Keywords,
+                Some(value_type),
+                parameter_index,
+                parameter,
+                false,
+                true,
+                ParameterMatchKind::Definitive,
+            );
         }
     }
 
@@ -4116,12 +4194,12 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         for (
             index,
             ParameterInfo {
-                matched,
+                match_state,
                 suppress_missing_error,
             },
         ) in self.parameter_info.iter().copied().enumerate()
         {
-            if !matched {
+            if !match_state.is_definitive() {
                 if suppress_missing_error {
                     continue;
                 }
@@ -4837,26 +4915,51 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         argument: Argument<'a>,
         argument_type: Type<'db>,
     ) {
-        if let Type::TypedDict(typed_dict) = argument_type {
-            for (argument_type, parameter_index) in typed_dict
-                .items(self.db)
-                .values()
-                .map(|field| field.declared_ty)
-                .zip(&self.argument_matches[argument_index].parameters)
+        if self.argument_matches[argument_index]
+            .types
+            .iter()
+            .any(Option::is_some)
+        {
+            if extract_unpacked_typed_dict_keys(self.db, argument_type).is_none()
+                && argument_type.as_paramspec_typevar(self.db).is_none()
             {
+                let Some((key_type, _)) = argument_type.unpack_keys_and_items(self.db) else {
+                    return;
+                };
+
+                if !key_type
+                    .when_assignable_to(
+                        self.db,
+                        KnownClass::Str.to_instance(self.db),
+                        constraints,
+                        self.inferable_typevars,
+                    )
+                    .is_always_satisfied(self.db)
+                {
+                    self.errors.push(BindingError::InvalidKeyType {
+                        argument_index: adjusted_argument_index,
+                        provided_ty: key_type,
+                    });
+                }
+            }
+
+            for (parameter_index, argument_type) in self.argument_matches[argument_index].iter() {
+                let Some(argument_type) = argument_type else {
+                    continue;
+                };
+
                 self.check_argument_type(
                     constraints,
                     argument_index,
                     adjusted_argument_index,
                     argument,
                     argument_type,
-                    *parameter_index,
+                    parameter_index,
                 );
             }
 
             return;
         }
-
         let value_type_paramspec =
             if let Some(paramspec) = argument_type.as_paramspec_typevar(self.db) {
                 Some(paramspec)
@@ -5044,7 +5147,14 @@ impl<'db> Binding<'db> {
                     let _ = matcher.match_positional(argument_index, argument, None, false);
                 }
                 Argument::Keyword(name) => {
-                    let _ = matcher.match_keyword(argument_index, argument, None, name);
+                    let _ = matcher.match_keyword(
+                        db,
+                        argument_index,
+                        argument,
+                        None,
+                        name,
+                        ParameterMatchKind::Definitive,
+                    );
                 }
                 Argument::Variadic => {
                     let _ = matcher.match_variadic(

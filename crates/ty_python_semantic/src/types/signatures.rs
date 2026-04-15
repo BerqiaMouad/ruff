@@ -10,6 +10,7 @@
 //! argument types and return types. For each callable type in the union, the call expression's
 //! arguments must match _at least one_ overload.
 
+use std::collections::BTreeMap;
 use std::slice::Iter;
 
 use itertools::{EitherOrBoth, Itertools};
@@ -26,6 +27,7 @@ use crate::types::infer::infer_deferred_types;
 use crate::types::relation::{
     HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker,
 };
+use crate::types::typed_dict::{UnpackedTypedDictKey, extract_unpacked_typed_dict_keys};
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType,
     FindLegacyTypeVarsVisitor, KnownClass, MaterializationKind, ParamSpecAttrKind, SelfBinding,
@@ -2733,26 +2735,46 @@ impl<'db> Parameters<'db> {
             )
         });
 
-        let keywords = kwarg.as_ref().map(|arg| {
-            Parameter::from_node_and_kind(
+        let mut value = positional_only
+            .into_iter()
+            .chain(positional_or_keyword)
+            .chain(variadic)
+            .chain(keyword_only)
+            .collect::<Vec<_>>();
+
+        if let Some(arg) = kwarg.as_ref() {
+            let keywords = Parameter::from_node_and_kind(
                 db,
                 definition,
                 arg,
                 ParameterKind::KeywordVariadic {
                     name: arg.name.id.clone(),
                 },
-            )
-        });
+            );
 
-        Self::new(
-            db,
-            positional_only
-                .into_iter()
-                .chain(positional_or_keyword)
-                .chain(variadic)
-                .chain(keyword_only)
-                .chain(keywords),
-        )
+            if let Some(unpacked_keys) = keywords.unpacked_typed_dict_keys(db) {
+                for (name, unpacked_key) in unpacked_keys {
+                    if value
+                        .iter()
+                        .any(|parameter| parameter.callable_by_name(name.as_str()))
+                    {
+                        continue;
+                    }
+
+                    value.push(
+                        Parameter::keyword_only(name)
+                            .with_annotated_type(unpacked_key.value_ty)
+                            .with_optional_default_type(
+                                (!unpacked_key.is_guaranteed_present()).then_some(Type::unknown()),
+                            ),
+                    );
+                }
+            }
+
+            value.push(keywords);
+        }
+
+        Self::new(db, value)
     }
 
     fn apply_type_mapping_impl<'a>(
@@ -2853,11 +2875,39 @@ impl<'db> Parameters<'db> {
             .find(|(_, parameter)| parameter.callable_by_name(name))
     }
 
+    /// Return parameter (with index) for given keyword name, including fallback to an ordinary
+    /// `**kwargs` parameter that accepts arbitrary keyword names.
+    pub(crate) fn bindable_keyword_by_name(
+        &self,
+        db: &'db dyn Db,
+        name: &str,
+    ) -> Option<(usize, &Parameter<'db>)> {
+        self.keyword_by_name(name).or_else(|| {
+            self.keyword_variadic()
+                .filter(|(_, parameter)| !parameter.is_unpacked_typed_dict_keyword_variadic(db))
+        })
+    }
+
     /// Return the keywords parameter (`**kwargs`), if any, and its index, or `None`.
     pub(crate) fn keyword_variadic(&self) -> Option<(usize, &Parameter<'db>)> {
         self.iter()
             .enumerate()
             .rfind(|(_, parameter)| parameter.is_keyword_variadic())
+    }
+
+    /// Return the `**kwargs` parameter together with its unpacked `TypedDict` keys, if it is
+    /// annotated as `Unpack[TypedDict]`.
+    pub(crate) fn unpacked_typed_dict_keyword_variadic(
+        &self,
+        db: &'db dyn Db,
+    ) -> Option<(
+        usize,
+        &Parameter<'db>,
+        BTreeMap<Name, UnpackedTypedDictKey<'db>>,
+    )> {
+        let (index, parameter) = self.keyword_variadic()?;
+        let unpacked_keys = parameter.unpacked_typed_dict_keys(db)?;
+        Some((index, parameter, unpacked_keys))
     }
 }
 
@@ -3183,6 +3233,23 @@ impl<'db> Parameter<'db> {
             } => param_name == name,
             _ => false,
         }
+    }
+
+    /// Returns the unpacked `TypedDict` keys if this is a `**kwargs: Unpack[TypedDict]`
+    /// parameter.
+    pub(crate) fn unpacked_typed_dict_keys(
+        &self,
+        db: &'db dyn Db,
+    ) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
+        self.is_keyword_variadic()
+            .then(|| extract_unpacked_typed_dict_keys(db, self.annotated_type))
+            .flatten()
+    }
+
+    /// Returns `true` if this parameter is a `**kwargs: Unpack[TypedDict]` parameter that accepts
+    /// only the named keys of the unpacked `TypedDict`.
+    pub(crate) fn is_unpacked_typed_dict_keyword_variadic(&self, db: &'db dyn Db) -> bool {
+        self.unpacked_typed_dict_keys(db).is_some()
     }
 
     /// Annotated type of the parameter. If no annotation was provided, this is `Unknown`.

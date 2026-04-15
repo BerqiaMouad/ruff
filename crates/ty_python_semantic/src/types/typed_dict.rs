@@ -816,10 +816,37 @@ pub(super) fn validate_typed_dict_required_keys<'db, 'ast>(
     !has_missing_key
 }
 
-#[derive(Debug, Clone, Copy)]
-struct UnpackedTypedDictKey<'db> {
-    value_ty: Type<'db>,
-    is_required: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnpackedTypedDictKeyPresence {
+    /// The key is guaranteed to be present at runtime when the mapping is unpacked.
+    Guaranteed,
+    /// The key may be present at runtime when the mapping is unpacked.
+    Potential,
+}
+
+impl UnpackedTypedDictKeyPresence {
+    const fn from_guaranteed(guaranteed: bool) -> Self {
+        if guaranteed {
+            Self::Guaranteed
+        } else {
+            Self::Potential
+        }
+    }
+
+    pub(crate) const fn is_guaranteed(self) -> bool {
+        matches!(self, Self::Guaranteed)
+    }
+}
+
+pub(crate) struct UnpackedTypedDictKey<'db> {
+    pub(crate) value_ty: Type<'db>,
+    presence: UnpackedTypedDictKeyPresence,
+}
+
+impl<'db> UnpackedTypedDictKey<'db> {
+    pub(crate) const fn is_guaranteed_present(&self) -> bool {
+        self.presence.is_guaranteed()
+    }
 }
 
 /// Extracts `TypedDict` keys, their value types, and whether they are required when unpacked as
@@ -831,7 +858,7 @@ struct UnpackedTypedDictKey<'db> {
 /// intersected, and the key is considered required if any constituent `TypedDict` requires it.
 /// For unions, returns all keys that may appear in any arm, unioning value types for shared keys,
 /// and a key is only considered required if every arm requires it.
-fn extract_unpacked_typed_dict_keys<'db>(
+pub(crate) fn extract_unpacked_typed_dict_keys<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
 ) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
@@ -845,7 +872,9 @@ fn extract_unpacked_typed_dict_keys<'db>(
                         name.clone(),
                         UnpackedTypedDictKey {
                             value_ty: field.declared_ty,
-                            is_required: field.is_required(),
+                            presence: UnpackedTypedDictKeyPresence::from_guaranteed(
+                                field.is_required(),
+                            ),
                         },
                     )
                 })
@@ -877,7 +906,9 @@ fn extract_unpacked_typed_dict_keys<'db>(
                                 existing.value_ty,
                                 unpacked_key.value_ty,
                             );
-                            existing.is_required |= unpacked_key.is_required;
+                            if unpacked_key.is_guaranteed_present() {
+                                existing.presence = UnpackedTypedDictKeyPresence::Guaranteed;
+                            }
                         })
                         .or_insert(unpacked_key);
                 }
@@ -900,16 +931,16 @@ fn extract_unpacked_typed_dict_keys<'db>(
 
             for key in all_keys {
                 let mut value_ty = UnionBuilder::new(db);
-                let mut is_required = true;
+                let mut is_guaranteed = true;
                 let mut saw_key = false;
 
                 for key_map in &key_maps {
                     if let Some(unpacked_key) = key_map.get(&key) {
                         saw_key = true;
                         value_ty = value_ty.add(unpacked_key.value_ty);
-                        is_required &= unpacked_key.is_required;
+                        is_guaranteed &= unpacked_key.is_guaranteed_present();
                     } else {
-                        is_required = false;
+                        is_guaranteed = false;
                     }
                 }
 
@@ -918,7 +949,7 @@ fn extract_unpacked_typed_dict_keys<'db>(
                         key,
                         UnpackedTypedDictKey {
                             value_ty: value_ty.build(),
-                            is_required,
+                            presence: UnpackedTypedDictKeyPresence::from_guaranteed(is_guaranteed),
                         },
                     );
                 }
@@ -1008,11 +1039,9 @@ pub(super) fn collect_guaranteed_keyword_keys<'db>(
         // Today we only suppress positional-key diagnostics for explicit keywords and unpacked
         // TypedDicts, which makes those literal-unpack cases inconsistent with equivalent calls.
         } else if let Some(unpacked_keys) = extract_unpacked_typed_dict_keys(db, unpacked_type) {
-            provided_keys.extend(
-                unpacked_keys
-                    .into_iter()
-                    .filter_map(|(key, unpacked_key)| unpacked_key.is_required.then_some(key)),
-            );
+            provided_keys.extend(unpacked_keys.into_iter().filter_map(|(key, unpacked_key)| {
+                unpacked_key.is_guaranteed_present().then_some(key)
+            }));
         }
     }
 
@@ -1117,7 +1146,7 @@ fn validate_extracted_typed_dict_keys<'db, 'ast>(
         if ignored_keys.contains(key_name) {
             continue;
         }
-        if unpacked_key.is_required {
+        if unpacked_key.is_guaranteed_present() {
             provided_keys.insert(key_name.clone());
         }
         TypedDictKeyAssignment {

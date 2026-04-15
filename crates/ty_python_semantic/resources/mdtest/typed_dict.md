@@ -2951,6 +2951,110 @@ td3: TD2 = {"required": "hello"}  # Valid
 bad_td2: TD2 = {"optional": 42}
 ```
 
+## `Unpack[TypedDict]` in `**kwargs`
+
+Using `Unpack[TypedDict]` on a `**kwargs` parameter should expose the `TypedDict` shape both inside
+the function body and in the callable signature:
+
+```py
+from typing import Protocol, TypeVar
+from typing_extensions import NotRequired, Required, TypedDict, Unpack
+
+class TD1(TypedDict):
+    v1: Required[int]
+    v2: NotRequired[str]
+
+class TD2(TD1):
+    v3: Required[str]
+
+def func1(**kwargs: Unpack[TD2]) -> None:
+    reveal_type(kwargs)  # revealed: TD2
+    reveal_type(kwargs["v1"])  # revealed: int
+    if "v2" in kwargs:
+        reveal_type(kwargs["v2"])  # revealed: str
+    reveal_type(kwargs["v3"])  # revealed: str
+
+# error: [missing-argument]
+func1()
+func1(v1=1, v3="ok")
+
+# error: [unknown-argument]
+func1(v1=1, v3="ok", v4=1)
+
+td2 = TD2(v1=1, v3="ok")
+func1(**td2)
+
+untyped_dict: dict[str, str] = {}
+# error: [missing-argument]
+# error: [invalid-argument-type]
+func1(**untyped_dict)
+
+# error: [parameter-already-assigned]
+func1(v1=1, **td2)
+
+class ExplicitKwargs(Protocol):
+    def __call__(self, *, v1: int, v3: str, v2: str = "") -> None: ...
+
+class TypedDictKwargs(Protocol):
+    def __call__(self, **kwargs: Unpack[TD2]) -> None: ...
+
+class MissingRequiredKwarg(Protocol):
+    def __call__(self, *, v1: int) -> None: ...
+
+explicit_ok: ExplicitKwargs = func1
+typed_dict_ok: TypedDictKwargs = func1
+
+# error: [invalid-assignment]
+missing_required: MissingRequiredKwarg = func1
+
+def func7(*, v1: int, v3: str, v2: str = "") -> None:
+    pass
+
+# error: [invalid-assignment]
+typed_dict_bad: TypedDictKwargs = func7
+
+def func5(v1: int, **kwargs: Unpack[TD2]) -> None:  # error: [invalid-type-form]
+    pass
+
+T = TypeVar("T", bound=TD2)
+
+def func6(**kwargs: Unpack[T]) -> None:  # error: [invalid-type-form]
+    pass
+
+class MaybeX(TypedDict, total=False):
+    x: str
+
+class MaybeExtra(TypedDict, total=False):
+    extra: int
+
+LegacyKwargs = TypedDict("LegacyKwargs", {"__x": int})
+
+def takes_name(*, name: str) -> None: ...
+def takes_x(*, x: int) -> None: ...
+def takes_y(*, y: int) -> None: ...
+def legacy(__x: int, **kwargs: Unpack[LegacyKwargs]) -> None:
+    reveal_type(kwargs)  # revealed: LegacyKwargs
+
+def _regressions(
+    maybe_x: MaybeX,
+    maybe_extra: MaybeExtra,
+    int_key_dict: dict[int, str],
+    legacy_kwargs: LegacyKwargs,
+) -> None:
+    # error: [invalid-argument-type]
+    takes_name(**int_key_dict)
+
+    # error: [parameter-already-assigned]
+    # error: [invalid-argument-type]
+    takes_x(x=1, **maybe_x)
+
+    # error: [missing-argument]
+    # error: [unknown-argument]
+    takes_y(**maybe_extra)
+
+    legacy(1, **legacy_kwargs)
+```
+
 ## Recursive functional `TypedDict` (unstringified forward reference)
 
 Forward references in functional `TypedDict` calls must be stringified, since the field types are
