@@ -53,10 +53,11 @@ use crate::types::typed_dict::extract_unpacked_typed_dict_keys;
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::{
     BoundMethodType, BoundTypeVarInstance, CallableType, ClassLiteral, DATACLASS_FLAGS,
-    DataclassFlags, DataclassParams, GenericAlias, InternedConstraintSet, IntersectionType,
-    KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind, NominalInstanceType,
-    PropertyInstanceType, SpecialFormType, TypeAliasType, TypeContext, TypeVarBoundOrConstraints,
-    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members,
+    DataclassFlags, DataclassParams, DynamicType, GenericAlias, InternedConstraintSet,
+    IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
+    NominalInstanceType, PropertyInstanceType, SpecialFormType, TypeAliasType, TypeContext,
+    TypeVarBoundOrConstraints, TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind,
+    enums, list_members,
 };
 use crate::{DisplaySettings, FxOrderSet, Program};
 use ruff_db::diagnostic::{Annotation, Diagnostic, SubDiagnostic, SubDiagnosticSeverity};
@@ -4125,13 +4126,31 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if let Some((parameter_index, parameter, _)) =
             self.parameters.unpacked_typed_dict_keyword_variadic(db)
         {
-            self.errors.push(BindingError::InvalidArgumentType {
-                parameter: ParameterContext::new(parameter, parameter_index, false),
-                argument_index: self.get_argument_index(argument_index),
-                expected_ty: parameter.annotated_type(),
-                provided_ty: argument_type.unwrap_or_else(Type::unknown),
+            let permissive_any_mapping = argument_type.is_some_and(|argument_type| {
+                let Some((key_ty, value_ty)) = argument_type.unpack_keys_and_items(db) else {
+                    return false;
+                };
+
+                key_ty.is_assignable_to(db, KnownClass::Str.to_instance(db))
+                    && matches!(
+                        value_ty.resolve_type_alias(db).as_dynamic(),
+                        Some(
+                            DynamicType::Any
+                                | DynamicType::Unknown
+                                | DynamicType::UnknownGeneric(_)
+                        )
+                    )
             });
-            return;
+
+            if !permissive_any_mapping {
+                self.errors.push(BindingError::InvalidArgumentType {
+                    parameter: ParameterContext::new(parameter, parameter_index, false),
+                    argument_index: self.get_argument_index(argument_index),
+                    expected_ty: parameter.annotated_type(),
+                    provided_ty: argument_type.unwrap_or_else(Type::unknown),
+                });
+                return;
+            }
         }
 
         for (parameter_index, parameter) in self.parameters.iter().enumerate() {

@@ -60,7 +60,7 @@ If a dict literal is inferred against a union containing both a `TypedDict` and 
 extra keys accepted by the non-`TypedDict` arm should not trigger eager `TypedDict` diagnostics:
 
 ```py
-from typing import Any
+from typing import Any, TypedDict
 
 class FormatterConfig(TypedDict, total=False):
     format: str
@@ -1257,7 +1257,7 @@ test all the permutations:
 
 ```py
 from typing import Any
-from typing_extensions import ReadOnly
+from typing_extensions import ReadOnly, TypedDict, Unpack
 
 class RequiredMutableInt(TypedDict):
     x: int
@@ -3053,6 +3053,34 @@ def _regressions(
     takes_y(**maybe_extra)
 
     legacy(1, **legacy_kwargs)
+```
+
+## `dict[str, Any]` remains permissive
+
+When the unpacked mapping is `dict[str, Any]`, other type checkers treat it as permissive and do not
+require ty to prove the full `TypedDict` key set up front:
+
+```py
+from typing import Any
+from typing_extensions import TypedDict, Unpack
+
+class AnyKwargs(TypedDict, total=False):
+    name: str
+
+def accepts_any_kwargs(**kwargs: Unpack[AnyKwargs]) -> None: ...
+
+class AcceptsAnyKwargs:
+    def __init__(self, **kwargs: Unpack[AnyKwargs]) -> None:
+        pass
+
+class ForwardingWrapper(AcceptsAnyKwargs):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+def _(kwargs: dict[str, Any]) -> None:
+    accepts_any_kwargs(**kwargs)
+    AcceptsAnyKwargs(**kwargs)
+    ForwardingWrapper(**kwargs)
 ```
 
 ## Recursive functional `TypedDict` (unstringified forward reference)

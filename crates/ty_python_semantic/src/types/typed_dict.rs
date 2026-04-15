@@ -843,7 +843,7 @@ pub(crate) struct UnpackedTypedDictKey<'db> {
     presence: UnpackedTypedDictKeyPresence,
 }
 
-impl<'db> UnpackedTypedDictKey<'db> {
+impl UnpackedTypedDictKey<'_> {
     pub(crate) const fn is_guaranteed_present(&self) -> bool {
         self.presence.is_guaranteed()
     }
